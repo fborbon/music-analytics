@@ -36,7 +36,7 @@ The stress score is a weighted blend of three normalized features:
 
 ## Data processing pipeline
 
-The notebook follows six sequential stages for each audio file.
+The notebook follows seven sequential stages for each audio file.
 
 ### 1. Configuration
 
@@ -121,75 +121,189 @@ Songs are ranked by the arithmetic mean of their smoothed stress curve. The thre
 
 ---
 
-## Data flow diagram
+## Function-level data flow
+
+The diagram below traces each Python function call, its inputs, its outputs, and how data moves through the notebook from raw URL to final PNG files.
 
 ```mermaid
 flowchart TD
-    subgraph INPUT["Input"]
-        A["YouTube Playlist URL\n+ Config variables"]
+    subgraph INPUT["Inputs"]
+        URL["PLAYLIST_URL\n(YouTube URL string)"]
+        CFG["SR=22050 · HOP_LENGTH=512\nSMOOTH_SEC=5 · N_SONGS=40"]
     end
 
-    subgraph DOWNLOAD["Download  (yt-dlp)"]
-        B["Fetch N songs\nConvert to MP3 via FFmpeg"]
-        C[("downloads/&lt;playlist-id&gt;/\n*.mp3\n.yt-dlp-archive")]
+    URL -->|"re.search(r'[?&]list=([^&]+)')"| PID["playlist_id string"]
+    PID --> DIR["DOWNLOAD_DIR\nPath('downloads/&lt;playlist-id&gt;')"]
+    DIR & CFG --> STEP1
+
+    subgraph STEP1["Step 1 — Download  (yt-dlp)"]
+        D1["yt_dlp.YoutubeDL(ydl_opts)\n▸ format: bestaudio\n▸ FFmpegExtractAudio → MP3 192 kbps\n▸ playlistend: N_SONGS\n▸ download_archive: .yt-dlp-archive"]
+        MP3[("NN_title.mp3 files\n.yt-dlp-archive (skip list)")]
+        D1 --> MP3
     end
 
-    subgraph LOAD["Audio Loading  (librosa)"]
-        D["librosa.load\nDecode MP3 → float32 waveform\nResample to 22 050 Hz · mono"]
-        E["Waveform array  y\n~22 000 samples / second"]
+    MP3 --> STEP2
+
+    subgraph STEP2["Step 2 — Load  (librosa / soundfile)"]
+        L1["librosa.load(path, sr=22050, mono=True)"]
+        L2["↳ soundfile reads MP3 bytes\n↳ resample to 22 050 Hz\n↳ downmix to mono float32"]
+        Y["y : float32 array  [N_samples]\n~22 000 samples / sec"]
+        L1 --> L2 --> Y
     end
 
-    subgraph EXTRACT["Feature Extraction  (librosa)  — per frame ≈ 23 ms"]
-        F1["librosa.feature.rms\nLoudness per frame"]
-        F2["librosa.feature.spectral_centroid\nBrightness per frame"]
-        F3["librosa.onset.onset_strength\nRhythmic density per frame"]
-        F4["librosa.feature.melspectrogram\n+ power_to_db\nFrequency heatmap"]
-        FC[(".features.npz cache\nskip on re-run")]
+    Y --> STEP3
+
+    subgraph STEP3["Step 3 — compute_features(fpath, sr, hop_length)"]
+        CHK{"cache .features.npz\nexists?"}
+        HIT["np.load(cache)\n→ rms, centroid, onset_env, times"]
+        RMS["librosa.feature.rms(y, hop_length=512)\n→ rms [F frames]"]
+        CEN["librosa.feature.spectral_centroid(y, sr, hop=512)\n→ centroid [F frames]"]
+        ONS["librosa.onset.onset_strength(y, sr, hop=512)\n→ onset_env [F frames]"]
+        TIM["librosa.times_like(rms, sr=22050, hop=512)\n→ times [F frames]"]
+        SAVE["np.savez(cache, rms, centroid, onset_env, times)"]
+        CHK -->|"yes"| HIT
+        CHK -->|"no"| RMS & CEN & ONS & TIM --> SAVE
     end
 
-    subgraph SCORE["Scoring  (numpy · scipy)"]
-        G["norm01()\nMin-max scale each feature → 0..1"]
-        H["Weighted blend\n0.50 × RMS + 0.25 × centroid + 0.25 × onset\n→ stress_raw"]
-        I["uniform_filter1d  (scipy)\nSmooth over SMOOTH_SEC window\n→ stress_smooth"]
+    HIT & SAVE --> FEATS["rms[F] · centroid[F] · onset_env[F] · times[F]\nF ≈ duration_s × 22050 / 512  (e.g. 12 127 frames for a 4.7 min song)"]
+
+    FEATS --> STEP4
+
+    subgraph STEP4["Step 4 — Normalize & Score"]
+        N1["norm01(x) = (x − min) / (max − min + 1e-8)\napplied independently to rms, centroid, onset_env"]
+        N2["stress_raw =\n  0.50 × norm01(rms)\n+ 0.25 × norm01(centroid)\n+ 0.25 × norm01(onset_env)"]
+        N1 --> N2
     end
 
-    subgraph OUTPUTS["Outputs  (matplotlib · librosa.display)"]
-        J["Per-song 3-panel chart\n① Stress curve  ② Feature breakdown  ③ Mel spectrogram\n&lt;title&gt;_stress.png"]
-        K["Batch overlay chart\nAll songs' stress arcs\nall_songs_stress.png"]
-        L["Top 3 vs Bottom 3\nRanked by mean stress score\ntop3_vs_bottom3_stress.png"]
+    N2 --> STEP5
+
+    subgraph STEP5["Step 5 — Smooth  (scipy)"]
+        S1["smooth_frames = int(SMOOTH_SEC × SR / HOP_LENGTH)\ne.g. 215 frames for SMOOTH_SEC=5"]
+        S2["uniform_filter1d(stress_raw, size=smooth_frames)\n→ stress_smooth  (box rolling average)"]
+        S3["norm01(stress_smooth)  ← re-normalize to [0, 1]"]
+        S1 --> S2 --> S3
     end
 
-    A --> B
-    B --> C
-    C --> D
-    D --> E
-    E --> F1 & F2 & F3 & F4
-    F1 & F2 & F3 -->|"first run — save"| FC
-    FC -->|"cache hit — load"| G
-    F1 & F2 & F3 -->|"first run"| G
-    G --> H
-    H --> I
-    F4 --> J
-    H --> J
-    I --> J
-    I --> K
-    I --> L
+    S3 --> BRANCH((" "))
+    Y --> BRANCH
+
+    BRANCH --> PER_SONG & BATCH_OVL & RANKING
+
+    subgraph PER_SONG["Per-Song Chart  (matplotlib · librosa.display)"]
+        PS1["Panel 1: ax.plot(times, stress_raw, color=steelblue)\n         ax.plot(times, stress_smooth, color=crimson)\nfmt_time(x, _) formats x-axis as mm:ss"]
+        PS2["Panel 2: ax.plot(times, norm01(rms), color=orange)\n         ax.plot(times, norm01(centroid), color=green)\n         ax.plot(times, norm01(onset_env), color=purple)"]
+        PS3["librosa.feature.melspectrogram(y, n_mels=128, hop=512)\nlibrosa.power_to_db(S, ref=np.max)\nlibrosa.display.specshow(S_dB, x_axis='time', y_axis='mel', cmap='magma')"]
+        PS4["plt.savefig('&lt;title&gt;_stress.png', dpi=150)"]
+        PS1 --> PS2 --> PS3 --> PS4
+    end
+
+    subgraph BATCH_OVL["Batch Overlay  (matplotlib)"]
+        BO1["for fpath in audio_files:\n  compute_features(fpath) → norm01 → uniform_filter1d"]
+        BO2["ax.plot(times, stress_smooth)\ntab10 palette, one color per song"]
+        BO3["plt.savefig('all_songs_stress.png', dpi=150)"]
+        BO1 --> BO2 --> BO3
+    end
+
+    subgraph RANKING["Top 3 vs Bottom 3  (matplotlib)"]
+        RK1["stress_means[fpath] = float(stress_smooth.mean())\nfor every song in playlist"]
+        RK2["ranked = sorted(stress_means, key=stress_means.get, reverse=True)\ntop3 = ranked[:3]  ·  bottom3 = ranked[-3:]"]
+        RK3["2-panel figure: warm colors (red/orange/yellow) for top3\ncool colors (blue/green/purple) for bottom3\nplt.savefig('top3_vs_bottom3_stress.png', dpi=150)"]
+        RK1 --> RK2 --> RK3
+    end
+
+    PS4  --> OUT1[("&lt;title&gt;_stress.png")]
+    BO3  --> OUT2[("all_songs_stress.png")]
+    RK3  --> OUT3[("top3_vs_bottom3_stress.png")]
 ```
+
+---
+
+## Scoring model
+
+### What kind of model is this?
+
+This project does **not** use any machine-learning or trained model. The stress score is a **handcrafted linear scoring function** — a deterministic formula that maps three acoustic measurements to a single perceptual value without any training data or optimization loop.
+
+```
+stress_raw[t] = 0.50 × norm(RMS[t]) + 0.25 × norm(centroid[t]) + 0.25 × norm(onset_env[t])
+```
+
+### Why this approach was chosen
+
+| Criterion | Rationale |
+|---|---|
+| **No labeled data needed** | There is no universally agreed ground-truth for how "stressed" or "intense" a song sounds — it is subjective. A supervised model would require a large, carefully labeled dataset that does not exist in a standard form. |
+| **Interpretability** | Each weight has a clear musical meaning. Analysts can immediately understand why a passage scores high or low. |
+| **Determinism** | The same audio always produces the same score. There are no random seeds, no model drift, no inference uncertainty. |
+| **Speed** | After feature extraction (the only expensive step), scoring is a handful of vectorized NumPy operations running in milliseconds. |
+
+### Why these specific weights?
+
+The 50 / 25 / 25 split is grounded in psychoacoustic research:
+
+- **RMS energy (50 %)** — Perceived loudness is the dominant dimension of musical intensity. Studies in psychoacoustics consistently show that overall amplitude is the strongest predictor of how energetic a passage feels.
+- **Spectral centroid (25 %)** — Brightness (the balance of treble vs. bass) is a secondary but significant contributor to perceived tension. Bright, treble-heavy passages (distorted guitars, cymbals, sharp synths) read as more intense than warm, bass-heavy ones.
+- **Onset strength (25 %)** — Rhythmic density adds perceived energy independently of loudness. A rapid flurry of quiet notes can feel just as busy as a loud sustained chord. Equal weight to centroid reflects that both dimensions carry roughly the same perceptual load.
+
+### Key parameters and their effect
+
+| Parameter | Default | Effect of increasing | Effect of decreasing |
+|---|---|---|---|
+| `SR` | 22 050 Hz | Higher frequency resolution, larger arrays, slower | Fewer samples, faster but misses high-frequency detail |
+| `HOP_LENGTH` | 512 samples (~23 ms) | Fewer frames, coarser time resolution | More frames, finer time resolution, slower |
+| `SMOOTH_SEC` | 5 s | Macro arc, hides verse/chorus boundaries | Fine arc, reacts to individual phrases |
+| `ε` in `norm01` | 1e-8 | (safety constant, avoid division by zero on silent tracks) | — |
+| Weight vector | [0.50, 0.25, 0.25] | Shifting weight to centroid → brightness-driven score | Shifting weight to onset → rhythm-driven score |
+
+### Normalization choice
+
+Min-max normalization was chosen over z-score (standardization) because it maps each feature to an absolute **[0, 1]** range regardless of units (Hz, dB-RMS, arbitrary onset units). This makes the weighted sum meaningful — all three features contribute on the same scale. The trade-off is that a single outlier frame (e.g., a very loud transient) can compress the rest of the curve toward 0; the `1e-8` epsilon prevents a complete division-by-zero on silent recordings.
+
+### Mel spectrogram (not a model — a perceptual transform)
+
+The bottom panel of each chart uses a **mel filterbank** to map the linear frequency axis to the mel scale — a nonlinear frequency scale that approximates how the human auditory system perceives pitch. The 128 mel bands are computed with `librosa.feature.melspectrogram`, then converted to decibels with `librosa.power_to_db`. This is a classical signal processing transform (not a learned model), chosen because it makes the spectrogram visually interpretable: equal vertical spacing corresponds to equal perceived pitch differences.
 
 ---
 
 ## Libraries
 
-| Library | Role in this project |
-|---|---|
-| **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** | Robust YouTube / playlist downloader. Selects the best-quality audio stream, invokes FFmpeg for format conversion, and maintains a download archive to avoid redundant fetches. |
-| **[librosa](https://librosa.org/)** | The core audio-analysis library. Handles MP3 decoding and resampling (`librosa.load`), computes all three acoustic features (`rms`, `spectral_centroid`, `onset_strength`), generates the mel spectrogram, and provides display utilities. |
-| **[soundfile](https://python-soundfile.readthedocs.io/)** | Backend audio I/O used by librosa to read and write WAV/FLAC/OGG files. Required even when loading MP3s because librosa delegates file reading to it. |
-| **[numpy](https://numpy.org/)** | Foundation for all numerical data. Features, waveforms, and spectrograms are NumPy arrays; min-max normalization and weighted blending are vectorized array operations. |
-| **[scipy](https://scipy.org/)** | Provides `scipy.ndimage.uniform_filter1d`, a fast 1-D uniform (box) filter used to smooth the per-frame stress curve into a readable macro arc. |
-| **[matplotlib](https://matplotlib.org/)** | Generates all charts — multi-panel figures, time-series overlays, color-mapped spectrograms, and batch comparisons. `ticker.FuncFormatter` formats the time axis as `mm:ss`. |
-| **[pathlib](https://docs.python.org/3/library/pathlib.html)** | Standard-library module for file-system paths. Used throughout to construct download directories, cache file paths, and output PNG paths in a cross-platform way. |
-| **[re](https://docs.python.org/3/library/re.html)** | Standard-library regex module. Extracts the playlist ID from the URL with a single pattern so the download folder name changes automatically when the playlist changes. |
+> **Note on AI technologies:** This project is a classical **digital signal processing (DSP)** pipeline. None of the libraries below involve generative AI (GenAI), large language models (LLMs), speech-to-text conversion, image diffusion models, image classification, chatbots, Retrieval-Augmented Generation (RAG), or agentic AI frameworks. The entire pipeline is algorithmic and deterministic.
+
+### `yt-dlp`
+**[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — Robust YouTube / playlist downloader, forked from youtube-dl with active maintenance and broader site support. In this project it selects the best available audio stream, delegates format conversion to FFmpeg (`FFmpegExtractAudio` post-processor), and maintains a `.yt-dlp-archive` file that prevents redundant re-downloads across notebook runs.
+
+### `librosa`
+**[librosa](https://librosa.org/)** — The core audio analysis library and the heart of the feature extraction pipeline. Built on top of NumPy and SciPy, it provides:
+- `librosa.load` — MP3/WAV decoding, resampling, and mono conversion (delegates to soundfile / audioread internally)
+- `librosa.feature.rms` — Frame-level root-mean-square energy
+- `librosa.feature.spectral_centroid` — Frequency-weighted centroid of the spectrum
+- `librosa.onset.onset_strength` — Spectral flux-based onset detection envelope
+- `librosa.feature.melspectrogram` — Mel-scaled power spectrogram using a triangular filterbank
+- `librosa.power_to_db` — Converts power to decibel scale
+- `librosa.display.specshow` — Renders spectrograms with correct frequency and time axes
+
+### `soundfile`
+**[soundfile](https://python-soundfile.readthedocs.io/)** — Low-level audio I/O backend used by librosa to read and write WAV, FLAC, and OGG files. It is based on libsndfile (a C library). Required even when loading MP3s because librosa's loading chain passes through it for format detection and decoding.
+
+### `numpy`
+**[numpy](https://numpy.org/)** — Foundation for all numerical computation in the pipeline. Every waveform, feature array, and spectrogram is a NumPy `ndarray`. Min-max normalization, the weighted stress blend, and array indexing are all vectorized NumPy operations, running orders of magnitude faster than Python loops.
+
+### `scipy`
+**[scipy](https://scipy.org/)** — Scientific computing library built on NumPy. The project uses `scipy.ndimage.uniform_filter1d`, a fast 1-D **uniform (box) filter** that applies a rolling average with equal weights across a sliding window. This is the smoothing step that converts the noisy per-frame stress signal into a readable macro arc.
+
+### `matplotlib`
+**[matplotlib](https://matplotlib.org/)** — The visualization engine for all three chart types. Specific features used:
+- `plt.subplots` with `gridspec_kw` for panels of different heights
+- `ax.fill_between` for semi-transparent area fills under stress curves
+- `ticker.FuncFormatter` with a custom `fmt_time` function to display the x-axis as `mm:ss`
+- `plt.get_cmap('tab10')` for the 10-color batch palette
+- `fig.colorbar` for the dB scale on the mel spectrogram panel
+
+### `pathlib`
+**[pathlib](https://docs.python.org/3/library/pathlib.html)** — Standard-library module for object-oriented file-system paths. Used throughout to construct download directories, feature cache paths (`.features.npz`), and output PNG paths in a cross-platform, string-concatenation-free way.
+
+### `re`
+**[re](https://docs.python.org/3/library/re.html)** — Standard-library regex module. Extracts the playlist ID from the URL with a single pattern (`[?&]list=([^&]+)`) so the download folder name changes automatically when the playlist URL changes.
 
 ---
 
