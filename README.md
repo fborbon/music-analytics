@@ -1,8 +1,24 @@
 # Music Energy & Stress Analysis
 
-Visualises the **energy arc** of songs over time — showing how a track builds from its intro, peaks at the chorus, and winds down at the outro.
+Visualises the **energy arc** of songs over time — showing how a track builds from its intro, peaks at the chorus, and winds down at the outro. Given a YouTube playlist, the notebook downloads audio as MP3, extracts three acoustic features per frame (RMS energy, spectral centroid, onset strength), blends them into a weighted stress score, smooths it with a rolling average, and produces three families of charts: per-song 3-panel breakdowns, a full-playlist overlay, and a top-3-vs-bottom-3 intensity ranking. The pipeline is deterministic, requires no AI models, and caches feature arrays to disk so re-runs are instant.
 
-Given a YouTube playlist of public-domain music, the notebook downloads the audio, extracts acoustic features with [librosa](https://librosa.org/), and produces a three-panel chart per song plus a batch overlay for the full playlist.
+**Main technologies:** Python · Jupyter Notebook · yt-dlp · librosa · soundfile · NumPy · SciPy · matplotlib
+
+**Monthly cost:** $0. This project uses no cloud services, no APIs, and no paid libraries. All processing runs locally on your machine. The only costs are electricity and internet bandwidth for the initial YouTube downloads.
+
+---
+
+## Table of Contents
+
+1. [What It Produces](#what-it-produces)
+2. [Stress Score](#stress-score)
+3. [Data Processing Pipeline](#data-processing-pipeline)
+4. [Function-Level Data Flow](#function-level-data-flow)
+5. [Scoring Model](#scoring-model)
+6. [Libraries](#libraries)
+7. [Setup](#setup)
+8. [Usage](#usage)
+9. [Default Playlist](#default-playlist)
 
 ---
 
@@ -345,3 +361,33 @@ jupyter lab music_stress_analysis.ipynb
 ## Default playlist
 
 The notebook is pre-configured with the [YouTube Audio Library — Free Public Domain Music](https://www.youtube.com/playlist?list=PLh5X0e7-mnI3lh-nb3fwZ8OcndGLfVdZX) playlist (334 tracks, CC0 / public domain). Swap `PLAYLIST_URL` for any other playlist.
+
+---
+
+## Auditing
+
+This section provides a structured checklist for review by an IT expert and an audio / music-information-retrieval subject-matter expert.
+
+### Audit Items
+
+- **Cost & resource minimization** — The project incurs $0 in costs. All processing is local; no cloud services, paid APIs, or licensed software are used. Bandwidth is the only cost, limited to initial YouTube downloads.
+- **IT architecture** — Seven well-defined sequential pipeline stages with `.npz` feature caching per song. The playlist-ID-derived download folder prevents cross-playlist cache collisions. Clean for a Jupyter notebook use case.
+- **Code efficiency** — Min-max normalization (`norm01`) is sensitive to outlier frames: a single very loud transient can compress the entire rest of the curve toward zero. The `1e-8` epsilon prevents division-by-zero on silent tracks but does not address the outlier problem. The box rolling average (`uniform_filter1d`) is the fastest choice for uniform smoothing.
+- **Cybersecurity** — No credentials or API keys required. No external data transmission beyond YouTube audio downloads. The `.yt-dlp-archive` file prevents redundant re-downloads.
+- **Readability & maintainability** — The 50/25/25 weight rationale is documented with psychoacoustic justification. The `SMOOTH_SEC` parameter's effect on macro arc vs. phrase-level detail is clearly explained. Configuration is centralized in one notebook cell.
+- **Scoring model adequacy** — The hand-crafted linear scoring function is a deliberate, well-justified design choice (no labeled training data exists for subjective "stress"). It is interpretable, deterministic, and fast. Its main limitation is that the weights are fixed and may not generalize across all musical genres (e.g., electronic music where loudness is heavily compressed).
+- **Legal** — The default playlist uses CC0 / public-domain audio. Users should verify the license of any custom playlist before redistribution of outputs. yt-dlp usage is subject to YouTube's Terms of Service.
+- **Other** — No automatic cleanup mechanism for downloaded MP3 files, which can accumulate significant disk space for large playlists. `N_SONGS` is the only resource bound.
+
+### Summary Table
+
+| Audit Item | Claude's Assessment | Human Expert Assessment |
+|---|---|---|
+| Cost & resource minimization | $0/month. Bandwidth for initial downloads is the only cost. No cloud or API dependency. | |
+| IT architecture | Clean sequential pipeline with per-song caching. Appropriate architecture for a notebook-based analysis tool. | |
+| Code efficiency | Min-max normalization vulnerable to outlier transients. Box filter is the right choice for uniform smoothing. | |
+| Cybersecurity | No credentials. No external transmission beyond YouTube downloads. No user data collected. | |
+| Readability & maintainability | Weight rationale and parameter effects are well-documented. Centralized configuration. | |
+| Scoring model adequacy | Intentionally hand-crafted (no training data). Interpretable and deterministic. May not generalize to heavily compressed genres. | |
+| Legal | Default playlist is CC0. Users must verify licenses for custom playlists. yt-dlp subject to YouTube ToS. | |
+| Other | No disk-space cleanup mechanism for accumulated MP3s. N_SONGS is the only download bound. | |
